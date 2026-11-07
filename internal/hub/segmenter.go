@@ -4,9 +4,9 @@ import "math"
 
 const (
 	rate           = 8000
-	frameSamples   = 160 // 20 ms
-	speechFrames   = 3   // frames above threshold before speech counts as started
-	preRollFrames  = 15  // audio kept from before speech started, so its start is not lost
+	frameSamples   = 160               // 20 ms
+	speechFrames   = 3                 // frames above threshold before speech counts as started
+	preRollFrames  = 15                // audio kept from before speech started, so its start is not lost
 	minVoiced      = 300 * rate / 1000 // loud audio an utterance needs, so a click is not speech
 	maxUtterance   = 15 * rate
 	minSpeechRMS   = 300.0
@@ -160,4 +160,20 @@ func Upsample2x(in []int16) []int16 {
 		out = append(out, int16((int(v)+int(next))/2))
 	}
 	return out
+}
+
+// encodeULaw converts a sample to mu-law.
+func encodeULaw(sample int16) byte {
+	const bias, clip = 0x84, 32635
+	s := int(sample)
+	sign := 0
+	if s < 0 {
+		s, sign = -s, 0x80
+	}
+	s = min(s, clip) + bias
+	exp := 7
+	for mask := 0x4000; s&mask == 0 && exp > 0; mask >>= 1 {
+		exp--
+	}
+	return ^byte(sign | exp<<4 | (s>>(exp+3))&0x0f)
 }

@@ -106,21 +106,6 @@ func (h *harness) transcripts() []speech.Event {
 	return out
 }
 
-func encodeULaw(sample int16) byte {
-	const bias, clip = 0x84, 32635
-	s := int(sample)
-	sign := 0
-	if s < 0 {
-		s, sign = -s, 0x80
-	}
-	s = min(s, clip) + bias
-	exp := 7
-	for mask := 0x4000; s&mask == 0 && exp > 0; mask >>= 1 {
-		exp--
-	}
-	return ^byte(sign | exp<<4 | (s>>(exp+3))&0x0f)
-}
-
 // sendAudio sends RTP of a tone at the given amplitude, faster than real time.
 func sendAudio(t *testing.T, conn *net.UDPConn, amplitude float64, millis int, pt byte) {
 	t.Helper()

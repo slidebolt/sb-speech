@@ -40,4 +40,7 @@ func TestOnStart_MissingWhisperStaysUpAndReportsDisabled(t *testing.T) {
 	if err := client.Stop("x"); err == nil || !strings.Contains(err.Error(), "disabled") {
 		t.Fatalf("stop err = %v", err)
 	}
+	if _, err := client.Say("x", "hi"); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("say err = %v", err)
+	}
 }

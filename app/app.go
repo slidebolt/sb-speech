@@ -13,6 +13,7 @@ import (
 	messenger "github.com/slidebolt/sb-messenger-sdk"
 	speech "github.com/slidebolt/sb-speech-sdk"
 	"github.com/slidebolt/sb-speech/internal/hub"
+	"github.com/slidebolt/sb-speech/internal/tts"
 	"github.com/slidebolt/sb-speech/internal/whisper"
 )
 
@@ -55,6 +56,7 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 	handlers := map[string]func(*messenger.Message){
 		speech.SubjectStart: a.handleStart,
 		speech.SubjectStop:  a.handleStop,
+		speech.SubjectSay:   a.handleSay,
 	}
 	for subject, handler := range handlers {
 		sub, err := msg.Subscribe(subject, handler)
@@ -90,12 +92,23 @@ func (a *App) configure() error {
 	if portMin <= 0 || portMax < portMin || portMax > 65535 {
 		return errors.New("SPEECH_RTP_PORT_MIN and SPEECH_RTP_PORT_MAX are not a valid range")
 	}
-	a.hub = hub.New(hub.Config{
+	cfg := hub.Config{
 		RTPHost: host, PortMin: portMin, PortMax: portMax,
 		SilenceMillis: envInt("SPEECH_SILENCE_MILLIS", 700),
 		Engine:        engine,
 		Publish:       a.publish,
-	})
+	}
+	// Speech output is optional: without a voice, transcription still works.
+	if voice := os.Getenv("SPEECH_PIPER_VOICE"); voice != "" {
+		p := &tts.Piper{Binary: envString("SPEECH_PIPER_PATH", "piper"), Voice: voice}
+		if err := p.Check(); err != nil {
+			log.Printf("sb-speech: speech output disabled: %v", err)
+		} else {
+			cfg.Voice = p
+			log.Println("sb-speech: speech output enabled")
+		}
+	}
+	a.hub = hub.New(cfg)
 	return nil
 }
 
@@ -151,6 +164,24 @@ func (a *App) handleStop(m *messenger.Message) {
 		reply.Error = "invalid request"
 	default:
 		a.hub.Stop(req.SessionID)
+	}
+	respond(m, reply)
+}
+
+func (a *App) handleSay(m *messenger.Message) {
+	var req speech.SayRequest
+	var reply speech.SayReply
+	switch {
+	case a.disabled != nil:
+		reply.Error = "speech service is disabled: " + a.disabled.Error()
+	case json.Unmarshal(m.Data, &req) != nil:
+		reply.Error = "invalid request"
+	default:
+		seq, err := a.hub.Say(req.SessionID, req.Text)
+		reply.Seq = seq
+		if err != nil {
+			reply.Error = err.Error()
+		}
 	}
 	respond(m, reply)
 }

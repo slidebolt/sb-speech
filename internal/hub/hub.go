@@ -5,11 +5,13 @@ package hub
 import (
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +29,24 @@ type Engine interface {
 	Transcribe(ctx context.Context, samples []int16) (string, error)
 }
 
+// Voice turns text into 8 kHz mono samples.
+type Voice interface {
+	Synthesize(ctx context.Context, text string) ([]int16, error)
+}
+
+// ErrNoVoice is returned by Say when speech output is not configured.
+var ErrNoVoice = errors.New("speech output is not configured")
+
+const (
+	// muteTail is how long incoming audio stays ignored after speaking, so the
+	// end of our own voice coming back is not transcribed.
+	muteTail = 300 * time.Millisecond
+)
+
+// senderWait is how long Say waits for the call's audio, whose source is where
+// speech is sent. A variable so tests can shorten it.
+var senderWait = 3 * time.Second
+
 // Config configures a Hub.
 type Config struct {
 	RTPHost       string
@@ -34,6 +54,7 @@ type Config struct {
 	PortMax       int
 	SilenceMillis int
 	Engine        Engine
+	Voice         Voice // optional; without it Say returns ErrNoVoice
 	Publish       func(speech.Event)
 }
 
@@ -61,6 +82,12 @@ type session struct {
 	done   sync.WaitGroup
 	once   sync.Once
 	seq    int
+
+	mu         sync.Mutex
+	sender     *net.UDPAddr
+	mutedUntil time.Time
+	saySeq     int
+	sayCancel  context.CancelFunc
 }
 
 // Start opens a session. The caller sends RTP to the returned address.
@@ -90,6 +117,27 @@ func (h *Hub) Start(req speech.StartRequest) (speech.StartReply, error) {
 	go s.readRTP()
 	go s.transcribe()
 	return speech.StartReply{SessionID: s.id, RTPHost: h.cfg.RTPHost, RTPPort: port}, nil
+}
+
+// Say speaks text back to the sender of a session's audio, interrupting anything
+// it is still saying. It returns the utterance's seq once accepted.
+func (h *Hub) Say(id, text string) (int, error) {
+	text = strings.TrimSpace(text)
+	switch {
+	case h.cfg.Voice == nil:
+		return 0, ErrNoVoice
+	case text == "":
+		return 0, errors.New("nothing to say")
+	case len(text) > speech.MaxSayLength:
+		return 0, fmt.Errorf("text is longer than %d characters", speech.MaxSayLength)
+	}
+	h.mu.Lock()
+	s := h.sessions[id]
+	h.mu.Unlock()
+	if s == nil {
+		return 0, errors.New("no such session")
+	}
+	return s.say(text)
 }
 
 // Stop ends a session. Stopping one that already ended is not an error.
@@ -178,10 +226,18 @@ func (s *session) readRTP() {
 		}
 		if sender == nil {
 			sender = from
+			s.mu.Lock()
+			s.sender = from
+			s.mu.Unlock()
 		} else if !sender.IP.Equal(from.IP) || sender.Port != from.Port {
 			continue
 		}
 		last = time.Now()
+		if s.muted() {
+			// Our own voice: drop it, and anything half-heard before it.
+			seg.Flush()
+			continue
+		}
 		for _, u := range seg.Write(DecodeULaw(payload)) {
 			s.enqueue(u)
 		}
@@ -239,4 +295,128 @@ func rtpPayload(p []byte) ([]byte, bool) {
 		return nil, false
 	}
 	return p[offset:end], true
+}
+
+func (s *session) muted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Now().Before(s.mutedUntil)
+}
+
+func (s *session) say(text string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ctx.Err() != nil {
+		return 0, errors.New("session has ended")
+	}
+	if s.sayCancel != nil {
+		s.sayCancel()
+	}
+	s.saySeq++
+	ctx, cancel := context.WithCancel(s.ctx)
+	s.sayCancel = cancel
+	s.done.Add(1)
+	go s.speak(ctx, s.saySeq, text)
+	return s.saySeq, nil
+}
+
+// speak synthesizes text and sends it as paced RTP to the session's sender.
+func (s *session) speak(ctx context.Context, seq int, text string) {
+	defer s.done.Done()
+	publish := func(ev speech.Event) {
+		if s.ctx.Err() == nil {
+			ev.SessionID, ev.Seq = s.id, seq
+			s.hub.publish(ev)
+		}
+	}
+	publish(speech.Event{Type: speech.EventSpeaking, Text: text})
+	fail := func(err string) { publish(speech.Event{Type: speech.EventSpoken, Text: text, Error: err}) }
+
+	samples, err := s.hub.cfg.Voice.Synthesize(ctx, text)
+	if ctx.Err() != nil {
+		fail("interrupted")
+		return
+	}
+	if err != nil {
+		log.Printf("sb-speech: %s: synthesize: %v", s.id, err)
+		fail(err.Error())
+		return
+	}
+	to := s.waitSender(ctx)
+	if to == nil {
+		if ctx.Err() != nil {
+			fail("interrupted")
+		} else {
+			fail("no audio from the call to reply to")
+		}
+		return
+	}
+
+	frames := (len(samples) + frameSamples - 1) / frameSamples
+	start := time.Now()
+	s.mu.Lock()
+	s.mutedUntil = start.Add(time.Duration(frames)*20*time.Millisecond + muteTail)
+	s.mu.Unlock()
+
+	var hdr [4]byte
+	_, _ = rand.Read(hdr[:])
+	rtpSeq := binary.BigEndian.Uint16(hdr[:2])
+	var tsb, ssrcb [4]byte
+	_, _ = rand.Read(tsb[:])
+	_, _ = rand.Read(ssrcb[:])
+	ts, ssrc := binary.BigEndian.Uint32(tsb[:]), binary.BigEndian.Uint32(ssrcb[:])
+
+	packet := make([]byte, rtpHeaderSize+frameSamples)
+	for f := 0; f < frames; f++ {
+		if wait := time.Until(start.Add(time.Duration(f) * 20 * time.Millisecond)); wait > 0 {
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+			}
+		}
+		if ctx.Err() != nil {
+			s.mu.Lock()
+			s.mutedUntil = time.Now().Add(muteTail)
+			s.mu.Unlock()
+			fail("interrupted")
+			return
+		}
+		packet[0], packet[1] = 0x80, payloadTypePCMU
+		if f == 0 {
+			packet[1] |= 0x80 // marker: start of a talkspurt
+		}
+		binary.BigEndian.PutUint16(packet[2:], rtpSeq)
+		binary.BigEndian.PutUint32(packet[4:], ts)
+		binary.BigEndian.PutUint32(packet[8:], ssrc)
+		for i := range frameSamples {
+			v := int16(0)
+			if n := f*frameSamples + i; n < len(samples) {
+				v = samples[n]
+			}
+			packet[rtpHeaderSize+i] = encodeULaw(v)
+		}
+		if _, err := s.conn.WriteToUDP(packet, to); err != nil && s.ctx.Err() == nil {
+			log.Printf("sb-speech: %s: send: %v", s.id, err)
+		}
+		rtpSeq++
+		ts += frameSamples
+	}
+	publish(speech.Event{Type: speech.EventSpoken, Text: text})
+}
+
+func (s *session) waitSender(ctx context.Context) *net.UDPAddr {
+	deadline := time.Now().Add(senderWait)
+	for {
+		s.mu.Lock()
+		to := s.sender
+		s.mu.Unlock()
+		if to != nil || time.Now().After(deadline) {
+			return to
+		}
+		select {
+		case <-time.After(20 * time.Millisecond):
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }

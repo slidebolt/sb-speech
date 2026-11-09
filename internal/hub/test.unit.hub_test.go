@@ -13,6 +13,14 @@ import (
 	speech "github.com/slidebolt/sb-speech-sdk"
 )
 
+// Telephone-rate sizes the PCMU tests are written in.
+const (
+	rate         = 8000
+	frameSamples = rate * frameMillis / 1000
+	minVoiced    = minVoicedMillis * rate / 1000
+	maxUtterance = maxUtteranceSec * rate
+)
+
 type fakeEngine struct {
 	mu    sync.Mutex
 	calls [][]int16
@@ -68,8 +76,17 @@ func newHarness(t *testing.T) *harness {
 }
 
 func (h *harness) start() speech.StartReply {
+	return h.startInput(speech.Input{Type: speech.InputRTP, Codec: speech.CodecPCMU, SampleRate: 8000})
+}
+
+// startWide opens a wideband G.722 session, as asterisk-host does.
+func (h *harness) startWide() speech.StartReply {
+	return h.startInput(speech.Input{Type: speech.InputRTP, Codec: speech.CodecG722, SampleRate: 16000})
+}
+
+func (h *harness) startInput(in speech.Input) speech.StartReply {
 	h.t.Helper()
-	r, err := h.hub.Start(speech.StartRequest{Input: speech.Input{Type: speech.InputRTP, Codec: speech.CodecPCMU, SampleRate: 8000}})
+	r, err := h.hub.Start(speech.StartRequest{Input: in})
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -117,6 +134,27 @@ func sendAudio(t *testing.T, conn *net.UDPConn, amplitude float64, millis int, p
 			v := amplitude * math.Sin(2*math.Pi*440*float64(f*frameSamples+i)/rate)
 			p[rtpHeaderSize+i] = encodeULaw(int16(v))
 		}
+		if _, err := conn.Write(p); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// sendWide sends G.722 RTP of a 16 kHz tone, faster than real time.
+func sendWide(t *testing.T, conn *net.UDPConn, amplitude float64, millis int) {
+	t.Helper()
+	enc := NewG722Encoder()
+	for f := range millis / 20 {
+		tone := make([]int16, 320)
+		for i := range tone {
+			tone[i] = int16(amplitude * math.Sin(2*math.Pi*440*float64(f*320+i)/16000))
+		}
+		p := make([]byte, rtpHeaderSize, rtpHeaderSize+160)
+		p[0], p[1] = 0x80, payloadTypeG722
+		binary.BigEndian.PutUint16(p[2:], uint16(f))
+		binary.BigEndian.PutUint32(p[4:], uint32(f*160))
+		p = enc.Encode(p, tone)
 		if _, err := conn.Write(p); err != nil {
 			t.Fatal(err)
 		}
@@ -271,7 +309,7 @@ func TestStartValidation(t *testing.T) {
 }
 
 func TestSegmenter_MaxLengthSplitsLongSpeech(t *testing.T) {
-	s := NewSegmenter(700)
+	s := NewSegmenter(700, rate)
 	loud := make([]int16, frameSamples)
 	for i := range loud {
 		loud[i] = 8000
@@ -289,7 +327,7 @@ func TestSegmenter_MaxLengthSplitsLongSpeech(t *testing.T) {
 }
 
 func TestSegmenter_NoiseFloorAdapts(t *testing.T) {
-	s := NewSegmenter(100)
+	s := NewSegmenter(100, rate)
 	noise := make([]int16, frameSamples)
 	for i := range noise {
 		noise[i] = 200
@@ -328,5 +366,33 @@ func TestUpsample2x(t *testing.T) {
 	}
 	if Upsample2x(nil) != nil {
 		t.Fatal("nil input")
+	}
+}
+
+func TestWidebandAudioReachesEngineAt16kHz(t *testing.T) {
+	h := newHarness(t)
+	conn := dial(t, h.startWide())
+	sendWide(t, conn, 0, 200)
+	sendWide(t, conn, 8000, 500)
+	sendWide(t, conn, 0, 300)
+	h.waitEvent(speech.EventTranscript)
+	got := h.engine.calls[0]
+	// 500 ms of speech at 16 kHz is 8000 samples, plus pre-roll and trailing
+	// silence; upsampling it again would double that.
+	if len(got) < 8000 || len(got) > 16000 {
+		t.Fatalf("engine got %d samples; want the 16 kHz audio as sent", len(got))
+	}
+	if rms(got[len(got)/3:len(got)/2]) < 4000 {
+		t.Fatal("engine audio is not the tone: G.722 decoded wrongly")
+	}
+}
+
+func TestWidebandDropsMuLaw(t *testing.T) {
+	h := newHarness(t)
+	conn := dial(t, h.startWide())
+	sendAudio(t, conn, 8000, 500, payloadTypePCMU) // narrowband on a wideband session
+	time.Sleep(300 * time.Millisecond)
+	if h.engine.count() != 0 {
+		t.Fatal("mu-law audio reached a wideband session's engine")
 	}
 }

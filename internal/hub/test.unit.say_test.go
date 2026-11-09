@@ -14,25 +14,28 @@ import (
 	speech "github.com/slidebolt/sb-speech-sdk"
 )
 
-// fakeVoice returns a 1 kHz tone of millis length for any text.
+// fakeVoice returns a 1 kHz tone of millis length for any text, at the
+// requested rate.
 type fakeVoice struct {
 	mu     sync.Mutex
 	millis int
 	texts  []string
+	rates  []int
 	err    error
 }
 
-func (v *fakeVoice) Synthesize(ctx context.Context, text string) ([]int16, error) {
+func (v *fakeVoice) Synthesize(ctx context.Context, text string, rate int) ([]int16, error) {
 	v.mu.Lock()
 	v.texts = append(v.texts, text)
+	v.rates = append(v.rates, rate)
 	millis, err := v.millis, v.err
 	v.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]int16, millis*8)
+	out := make([]int16, millis*rate/1000)
 	for i := range out {
-		out[i] = int16(8000 * math.Sin(2*math.Pi*1000*float64(i)/8000))
+		out[i] = int16(8000 * math.Sin(2*math.Pi*1000*float64(i)/float64(rate)))
 	}
 	return out, nil
 }
@@ -272,5 +275,41 @@ func TestStopDuringSpeechEndsCleanly(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop hung while speaking")
+	}
+}
+
+func TestWidebandSaySendsG722(t *testing.T) {
+	h, v := newSayHarness(t, 400)
+	r := h.startWide()
+	conn := dial(t, r)
+	sendWide(t, conn, 0, 60)
+	time.Sleep(50 * time.Millisecond)
+
+	if _, err := h.hub.Say(r.SessionID, "the basement is on"); err != nil {
+		t.Fatal(err)
+	}
+	pkts := readPackets(t, conn, 300*time.Millisecond)
+	if len(pkts) != 20 {
+		t.Fatalf("400 ms of speech should be 20 packets, got %d", len(pkts))
+	}
+	dec := NewG722Decoder()
+	var heard []int16
+	for i, p := range pkts {
+		// G.722 is 16 kHz audio, but its RTP clock is 8 kHz (RFC 3551).
+		if p.pt != payloadTypeG722 || len(p.payload) != 160 {
+			t.Fatalf("packet %d: pt=%d len=%d; want G.722, 160 bytes", i, p.pt, len(p.payload))
+		}
+		if i > 0 && p.ts != pkts[i-1].ts+160 {
+			t.Fatalf("packet %d: timestamp step %d, want 160", i, p.ts-pkts[i-1].ts)
+		}
+		heard = dec.Decode(heard, p.payload)
+	}
+	if rms(heard[1600:4800]) < 4000 {
+		t.Fatal("sent audio does not decode to the tone")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if len(v.rates) != 1 || v.rates[0] != 16000 {
+		t.Fatalf("voice asked for rates %v, want 16000", v.rates)
 	}
 }

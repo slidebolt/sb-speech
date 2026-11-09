@@ -1,4 +1,4 @@
-// Package tts turns text into 8 kHz speech for sending back into a call.
+// Package tts turns text into speech, at the call's sample rate, for sending back into a call.
 package tts
 
 import (
@@ -43,8 +43,8 @@ func (p *Piper) Check() error {
 	return nil
 }
 
-// Synthesize returns text as 8 kHz mono samples.
-func (p *Piper) Synthesize(ctx context.Context, text string) ([]int16, error) {
+// Synthesize returns text as mono samples at rate.
+func (p *Piper) Synthesize(ctx context.Context, text string, rate int) ([]int16, error) {
 	if p.rate == 0 {
 		if err := p.Check(); err != nil {
 			return nil, err
@@ -62,7 +62,7 @@ func (p *Piper) Synthesize(ctx context.Context, text string) ([]int16, error) {
 	if err := binary.Read(bytes.NewReader(out[:len(samples)*2]), binary.LittleEndian, samples); err != nil {
 		return nil, err
 	}
-	return Resample(samples, p.rate, 8000), nil
+	return Resample(samples, p.rate, rate), nil
 }
 
 func lastLine(s string) string {

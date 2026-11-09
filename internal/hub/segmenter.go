@@ -3,21 +3,22 @@ package hub
 import "math"
 
 const (
-	rate           = 8000
-	frameSamples   = 160               // 20 ms
-	speechFrames   = 3                 // frames above threshold before speech counts as started
-	preRollFrames  = 15                // audio kept from before speech started, so its start is not lost
-	minVoiced      = 300 * rate / 1000 // loud audio an utterance needs, so a click is not speech
-	maxUtterance   = 15 * rate
-	minSpeechRMS   = 300.0
-	noiseMultiple  = 3.0
-	noiseSmoothing = 0.95
+	speechFrames    = 3   // frames above threshold before speech counts as started
+	preRollFrames   = 15  // audio kept from before speech started, so its start is not lost
+	minVoicedMillis = 300 // loud audio an utterance needs, so a click is not speech
+	maxUtteranceSec = 15
+	minSpeechRMS    = 300.0
+	noiseMultiple   = 3.0
+	noiseSmoothing  = 0.95
 )
 
 // Segmenter splits a stream of samples into utterances using energy. Speech is
 // audio louder than a noise floor it tracks during silence.
 type Segmenter struct {
 	silenceFrames int
+	frameSamples  int
+	minVoiced     int
+	maxUtterance  int
 
 	frame     []int16
 	preRoll   [][]int16
@@ -29,9 +30,16 @@ type Segmenter struct {
 	inSpeech  bool
 }
 
-// NewSegmenter ends an utterance after silenceMillis of quiet.
-func NewSegmenter(silenceMillis int) *Segmenter {
-	return &Segmenter{silenceFrames: max(1, silenceMillis/20), noise: minSpeechRMS / noiseMultiple}
+// NewSegmenter splits audio at the given sample rate, ending an utterance after
+// silenceMillis of quiet.
+func NewSegmenter(silenceMillis, rate int) *Segmenter {
+	return &Segmenter{
+		silenceFrames: max(1, silenceMillis/frameMillis),
+		frameSamples:  rate * frameMillis / 1000,
+		minVoiced:     minVoicedMillis * rate / 1000,
+		maxUtterance:  maxUtteranceSec * rate,
+		noise:         minSpeechRMS / noiseMultiple,
+	}
 }
 
 // Write adds samples and returns any utterances they completed.
@@ -39,7 +47,7 @@ func (s *Segmenter) Write(samples []int16) [][]int16 {
 	var out [][]int16
 	for _, v := range samples {
 		s.frame = append(s.frame, v)
-		if len(s.frame) == frameSamples {
+		if len(s.frame) == s.frameSamples {
 			if u := s.processFrame(s.frame); u != nil {
 				out = append(out, u)
 			}
@@ -79,7 +87,7 @@ func (s *Segmenter) processFrame(frame []int16) []int16 {
 		}
 		s.inSpeech = true
 		s.quiet = 0
-		s.voiced = s.loud * frameSamples
+		s.voiced = s.loud * s.frameSamples
 		for _, f := range s.preRoll {
 			s.utterance = append(s.utterance, f...)
 		}
@@ -90,11 +98,11 @@ func (s *Segmenter) processFrame(frame []int16) []int16 {
 	s.utterance = append(s.utterance, frame...)
 	if isLoud {
 		s.quiet = 0
-		s.voiced += frameSamples
+		s.voiced += s.frameSamples
 	} else {
 		s.quiet++
 	}
-	if s.quiet >= s.silenceFrames || len(s.utterance) >= maxUtterance {
+	if s.quiet >= s.silenceFrames || len(s.utterance) >= s.maxUtterance {
 		return s.finish()
 	}
 	return nil
@@ -108,7 +116,7 @@ func (s *Segmenter) finish() []int16 {
 	s.loud = 0
 	s.quiet = 0
 	s.voiced = 0
-	if voiced < minVoiced {
+	if voiced < s.minVoiced {
 		return nil
 	}
 	return u

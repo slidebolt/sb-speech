@@ -19,9 +19,8 @@ import (
 )
 
 const (
-	rtpHeaderSize   = 12
-	payloadTypePCMU = 0
-	queuedMax       = 8
+	rtpHeaderSize = 12
+	queuedMax     = 8
 )
 
 // Engine turns 16 kHz mono samples into text.
@@ -29,9 +28,10 @@ type Engine interface {
 	Transcribe(ctx context.Context, samples []int16) (string, error)
 }
 
-// Voice turns text into 8 kHz mono samples.
+// Voice turns text into mono samples at the requested rate: the session's,
+// 8000 or 16000.
 type Voice interface {
-	Synthesize(ctx context.Context, text string) ([]int16, error)
+	Synthesize(ctx context.Context, text string, rate int) ([]int16, error)
 }
 
 // ErrNoVoice is returned by Say when speech output is not configured.
@@ -75,6 +75,7 @@ func New(cfg Config) *Hub {
 type session struct {
 	hub    *Hub
 	id     string
+	format format
 	conn   *net.UDPConn
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -93,7 +94,8 @@ type session struct {
 // Start opens a session. The caller sends RTP to the returned address.
 func (h *Hub) Start(req speech.StartRequest) (speech.StartReply, error) {
 	in := req.Input
-	if in.Type != speech.InputRTP || in.Codec != speech.CodecPCMU || in.SampleRate != 8000 {
+	f, ok := formatFor(in)
+	if !ok {
 		return speech.StartReply{}, fmt.Errorf("input %s/%s/%d is not supported", in.Type, in.Codec, in.SampleRate)
 	}
 	h.mu.Lock()
@@ -111,7 +113,7 @@ func (h *Hub) Start(req speech.StartRequest) (speech.StartReply, error) {
 		return speech.StartReply{}, fmt.Errorf("session id: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s := &session{hub: h, id: hex.EncodeToString(b), conn: conn, ctx: ctx, cancel: cancel, queue: make(chan []int16, queuedMax)}
+	s := &session{hub: h, id: hex.EncodeToString(b), format: f, conn: conn, ctx: ctx, cancel: cancel, queue: make(chan []int16, queuedMax)}
 	h.sessions[s.id] = s
 	s.done.Add(2)
 	go s.readRTP()
@@ -201,7 +203,8 @@ func (h *Hub) listen() (*net.UDPConn, int, error) {
 func (s *session) readRTP() {
 	defer s.done.Done()
 	defer close(s.queue)
-	seg := NewSegmenter(s.hub.cfg.SilenceMillis)
+	seg := NewSegmenter(s.hub.cfg.SilenceMillis, s.format.rate)
+	decode := s.format.decoder()
 	buf := make([]byte, 2048)
 	var sender *net.UDPAddr
 	last := time.Now()
@@ -220,8 +223,8 @@ func (s *session) readRTP() {
 			}
 			continue
 		}
-		payload, ok := rtpPayload(buf[:n])
-		if !ok {
+		payload, pt, ok := rtpPayload(buf[:n])
+		if !ok || pt != s.format.payloadType() {
 			continue
 		}
 		if sender == nil {
@@ -238,7 +241,7 @@ func (s *session) readRTP() {
 			seg.Flush()
 			continue
 		}
-		for _, u := range seg.Write(DecodeULaw(payload)) {
+		for _, u := range seg.Write(decode(payload)) {
 			s.enqueue(u)
 		}
 	}
@@ -259,7 +262,10 @@ func (s *session) enqueue(u []int16) {
 func (s *session) transcribe() {
 	defer s.done.Done()
 	for u := range s.queue {
-		text, err := s.hub.cfg.Engine.Transcribe(s.ctx, Upsample2x(u))
+		if s.format.rate == 8000 {
+			u = Upsample2x(u)
+		}
+		text, err := s.hub.cfg.Engine.Transcribe(s.ctx, u)
 		if s.ctx.Err() != nil {
 			return
 		}
@@ -276,14 +282,16 @@ func (s *session) transcribe() {
 	}
 }
 
-func rtpPayload(p []byte) ([]byte, bool) {
-	if len(p) < rtpHeaderSize || p[0]>>6 != 2 || p[1]&0x7f != payloadTypePCMU {
-		return nil, false
+// rtpPayload returns an RTP packet's payload and payload type.
+func rtpPayload(p []byte) ([]byte, byte, bool) {
+	if len(p) < rtpHeaderSize || p[0]>>6 != 2 {
+		return nil, 0, false
 	}
+	pt := p[1] & 0x7f
 	offset := rtpHeaderSize + int(p[0]&0x0f)*4
 	if p[0]&0x10 != 0 {
 		if len(p) < offset+4 {
-			return nil, false
+			return nil, 0, false
 		}
 		offset += 4 + (int(p[offset+2])<<8|int(p[offset+3]))*4
 	}
@@ -292,9 +300,9 @@ func rtpPayload(p []byte) ([]byte, bool) {
 		end -= int(p[len(p)-1])
 	}
 	if offset >= end {
-		return nil, false
+		return nil, 0, false
 	}
-	return p[offset:end], true
+	return p[offset:end], pt, true
 }
 
 func (s *session) muted() bool {
@@ -332,7 +340,7 @@ func (s *session) speak(ctx context.Context, seq int, text string) {
 	publish(speech.Event{Type: speech.EventSpeaking, Text: text})
 	fail := func(err string) { publish(speech.Event{Type: speech.EventSpoken, Text: text, Error: err}) }
 
-	samples, err := s.hub.cfg.Voice.Synthesize(ctx, text)
+	samples, err := s.hub.cfg.Voice.Synthesize(ctx, text, s.format.rate)
 	if ctx.Err() != nil {
 		fail("interrupted")
 		return
@@ -352,6 +360,7 @@ func (s *session) speak(ctx context.Context, seq int, text string) {
 		return
 	}
 
+	frameSamples := s.format.frameSamples()
 	frames := (len(samples) + frameSamples - 1) / frameSamples
 	start := time.Now()
 	s.mu.Lock()
@@ -366,7 +375,10 @@ func (s *session) speak(ctx context.Context, seq int, text string) {
 	_, _ = rand.Read(ssrcb[:])
 	ts, ssrc := binary.BigEndian.Uint32(tsb[:]), binary.BigEndian.Uint32(ssrcb[:])
 
-	packet := make([]byte, rtpHeaderSize+frameSamples)
+	pt, step := s.format.payloadType(), uint32(s.format.frameBytes())
+	encode := s.format.encoder()
+	packet := make([]byte, 0, rtpHeaderSize+s.format.frameBytes())
+	frame := make([]int16, frameSamples)
 	for f := 0; f < frames; f++ {
 		if wait := time.Until(start.Add(time.Duration(f) * 20 * time.Millisecond)); wait > 0 {
 			select {
@@ -381,25 +393,22 @@ func (s *session) speak(ctx context.Context, seq int, text string) {
 			fail("interrupted")
 			return
 		}
-		packet[0], packet[1] = 0x80, payloadTypePCMU
+		packet = packet[:rtpHeaderSize]
+		packet[0], packet[1] = 0x80, pt
 		if f == 0 {
 			packet[1] |= 0x80 // marker: start of a talkspurt
 		}
 		binary.BigEndian.PutUint16(packet[2:], rtpSeq)
 		binary.BigEndian.PutUint32(packet[4:], ts)
 		binary.BigEndian.PutUint32(packet[8:], ssrc)
-		for i := range frameSamples {
-			v := int16(0)
-			if n := f*frameSamples + i; n < len(samples) {
-				v = samples[n]
-			}
-			packet[rtpHeaderSize+i] = encodeULaw(v)
-		}
+		clear(frame)
+		copy(frame, samples[min(f*frameSamples, len(samples)):])
+		packet = encode(packet, frame)
 		if _, err := s.conn.WriteToUDP(packet, to); err != nil && s.ctx.Err() == nil {
 			log.Printf("sb-speech: %s: send: %v", s.id, err)
 		}
 		rtpSeq++
-		ts += frameSamples
+		ts += step
 	}
 	publish(speech.Event{Type: speech.EventSpoken, Text: text})
 }

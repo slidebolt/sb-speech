@@ -7,16 +7,30 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"os/exec"
-	"strings"
+	"strconv"
 )
 
-// Piper runs the piper binary once per utterance.
+// Piper runs the piper binary once per utterance and streams its audio, which
+// piper produces a sentence at a time, so speech can start before the whole
+// reply is synthesized.
 type Piper struct {
 	Binary string // e.g. piper, or a wrapper script
 	Voice  string // path to the .onnx voice; its .onnx.json sits beside it
-	rate   int
+
+	// Delivery. Zero leaves piper's default.
+	LengthScale     float64 // speaking pace: above 1 is slower
+	NoiseScale      float64 // variation in delivery
+	NoiseW          float64 // variation in phoneme length
+	SentenceSilence float64 // seconds of pause after each sentence
+	// GainDB is applied to everything spoken. Piper scales every sentence to
+	// full scale, so its peaks clip; a negative gain leaves headroom.
+	GainDB float64
+
+	rate int
 }
 
 // Check confirms the binary and voice exist and reads the voice's sample rate.
@@ -43,29 +57,95 @@ func (p *Piper) Check() error {
 	return nil
 }
 
-// Synthesize returns text as mono samples at rate.
-func (p *Piper) Synthesize(ctx context.Context, text string, rate int) ([]int16, error) {
-	if p.rate == 0 {
-		if err := p.Check(); err != nil {
-			return nil, err
+func (p *Piper) args() []string {
+	args := []string{"--model", p.Voice, "--output_raw", "--quiet"}
+	for _, o := range []struct {
+		flag string
+		v    float64
+	}{
+		{"--length_scale", p.LengthScale},
+		{"--noise_scale", p.NoiseScale},
+		{"--noise_w", p.NoiseW},
+		{"--sentence_silence", p.SentenceSilence},
+	} {
+		if o.v > 0 {
+			args = append(args, o.flag, strconv.FormatFloat(o.v, 'f', -1, 64))
 		}
 	}
+	return args
+}
+
+// Synthesize speaks text at rate, passing audio to emit as piper produces it.
+// It returns once all of it has been emitted.
+func (p *Piper) Synthesize(ctx context.Context, text string, rate int, emit func([]int16)) error {
+	if p.rate == 0 {
+		if err := p.Check(); err != nil {
+			return err
+		}
+	}
+	text = Speakable(text)
+	if text == "" {
+		return nil
+	}
 	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, p.Binary, "--model", p.Voice, "--output_raw", "--quiet")
-	cmd.Stdin = strings.NewReader(strings.ReplaceAll(text, "\n", " ") + "\n")
+	cmd := exec.CommandContext(ctx, p.Binary, p.args()...)
+	cmd.Stdin = bytes.NewReader([]byte(text + "\n"))
 	cmd.Stderr = &stderr
-	out, err := cmd.Output()
+	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("piper: %w: %s", err, lastLine(stderr.String()))
+		return err
 	}
-	samples := make([]int16, len(out)/2)
-	if err := binary.Read(bytes.NewReader(out[:len(samples)*2]), binary.LittleEndian, samples); err != nil {
-		return nil, err
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("piper: %w", err)
 	}
-	return Resample(samples, p.rate, rate), nil
+	gain := math.Pow(10, p.GainDB/20)
+	rs := NewResampler(p.rate, rate)
+	buf := make([]byte, 8192)
+	var odd []byte // half a sample left over from the last read
+	for {
+		n, rerr := out.Read(buf)
+		if n > 0 {
+			data := append(odd, buf[:n]...)
+			samples := make([]int16, len(data)/2)
+			_ = binary.Read(bytes.NewReader(data[:len(samples)*2]), binary.LittleEndian, samples)
+			odd = append([]byte(nil), data[len(samples)*2:]...)
+			applyGain(samples, gain)
+			if s := rs.Write(samples); len(s) > 0 {
+				emit(s)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			cmd.Wait()
+			return fmt.Errorf("piper: read: %w", rerr)
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("piper: %w: %s", err, lastLine(stderr.String()))
+	}
+	if s := rs.Flush(); len(s) > 0 {
+		emit(s)
+	}
+	return nil
+}
+
+func applyGain(s []int16, gain float64) {
+	if gain == 1 {
+		return
+	}
+	for i, v := range s {
+		s[i] = int16(math.Max(-32768, math.Min(32767, math.Round(float64(v)*gain))))
+	}
 }
 
 func lastLine(s string) string {
-	lines := strings.Split(strings.TrimSpace(s), "\n")
-	return lines[len(lines)-1]
+	for len(s) > 0 && (s[len(s)-1] == '\n' || s[len(s)-1] == ' ') {
+		s = s[:len(s)-1]
+	}
+	if i := bytes.LastIndexByte([]byte(s), '\n'); i >= 0 {
+		return s[i+1:]
+	}
+	return s
 }

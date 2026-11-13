@@ -22,22 +22,38 @@ type fakeVoice struct {
 	texts  []string
 	rates  []int
 	err    error
+	gap    time.Duration // pause after the second piece
 }
 
-func (v *fakeVoice) Synthesize(ctx context.Context, text string, rate int) ([]int16, error) {
+func (v *fakeVoice) Synthesize(ctx context.Context, text string, rate int, emit func([]int16)) error {
 	v.mu.Lock()
 	v.texts = append(v.texts, text)
 	v.rates = append(v.rates, rate)
-	millis, err := v.millis, v.err
+	millis, err, gap := v.millis, v.err, v.gap
 	v.mu.Unlock()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	out := make([]int16, millis*rate/1000)
 	for i := range out {
 		out[i] = int16(8000 * math.Sin(2*math.Pi*1000*float64(i)/float64(rate)))
 	}
-	return out, nil
+	// In uneven pieces, as a real voice produces them.
+	half := len(out) / 2
+	for _, p := range [][]int16{out[:half/3], out[half/3 : half], out[half:]} {
+		if len(p) == 0 {
+			continue
+		}
+		emit(p)
+		if gap > 0 && &p[0] == &out[half/3] {
+			select {
+			case <-time.After(gap): // the voice falls behind mid-reply
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return nil
 }
 
 func newSayHarness(t *testing.T, millis int) (*harness, *fakeVoice) {
@@ -251,6 +267,7 @@ func TestSynthesisFailureIsReported(t *testing.T) {
 	v.err = errors.New("voice broke")
 	v.mu.Unlock()
 	r := h.start()
+	sendAudio(t, dial(t, r), 0, 40, payloadTypePCMU)
 	if _, err := h.hub.Say(r.SessionID, "hello"); err != nil {
 		t.Fatal(err)
 	}
@@ -311,5 +328,52 @@ func TestWidebandSaySendsG722(t *testing.T) {
 	defer v.mu.Unlock()
 	if len(v.rates) != 1 || v.rates[0] != 16000 {
 		t.Fatalf("voice asked for rates %v, want 16000", v.rates)
+	}
+}
+
+// When the voice falls behind mid-reply, speech pauses and then carries on at
+// the normal pace, with the timestamp moved on over the gap: no burst of late
+// packets for the phone to rush through.
+func TestVoiceFallingBehindPausesInsteadOfBursting(t *testing.T) {
+	h, v := newSayHarness(t, 600)
+	v.mu.Lock()
+	v.gap = 600 * time.Millisecond // longer than the 300 ms already buffered
+	v.mu.Unlock()
+	r := h.start()
+	conn := dial(t, r)
+	sendAudio(t, conn, 0, 40, payloadTypePCMU)
+	time.Sleep(50 * time.Millisecond)
+	if _, err := h.hub.Say(r.SessionID, "a long reply"); err != nil {
+		t.Fatal(err)
+	}
+	pkts := readPackets(t, conn, 400*time.Millisecond)
+	if len(pkts) != 30 {
+		t.Fatalf("600 ms of speech should be 30 packets, got %d", len(pkts))
+	}
+	resumed := -1
+	for i := 1; i < len(pkts); i++ {
+		gap := pkts[i].at.Sub(pkts[i-1].at)
+		if gap > 100*time.Millisecond {
+			resumed = i
+			// The timestamp covers the pause, and a new talkspurt begins.
+			if d := pkts[i].ts - pkts[i-1].ts; d < 160*5 {
+				t.Fatalf("timestamp moved %d over a %v pause", d, gap)
+			}
+			if !pkts[i].marker {
+				t.Fatal("no marker on the packet after the pause")
+			}
+			continue
+		}
+		if pkts[i].ts != pkts[i-1].ts+160 {
+			t.Fatalf("packet %d: timestamp step %d without a pause", i, pkts[i].ts-pkts[i-1].ts)
+		}
+	}
+	if resumed < 0 {
+		t.Fatal("the voice paused, but the packets show no pause")
+	}
+	// After the pause, packets are paced, not sent as a burst.
+	rest := pkts[resumed:]
+	if span := rest[len(rest)-1].at.Sub(rest[0].at); span < time.Duration(len(rest)-2)*15*time.Millisecond {
+		t.Fatalf("%d packets after the pause took only %v: a burst", len(rest), span)
 	}
 }

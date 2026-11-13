@@ -100,7 +100,17 @@ func (a *App) configure() error {
 	}
 	// Speech output is optional: without a voice, transcription still works.
 	if voice := os.Getenv("SPEECH_PIPER_VOICE"); voice != "" {
-		p := &tts.Piper{Binary: envString("SPEECH_PIPER_PATH", "piper"), Voice: voice}
+		p := &tts.Piper{
+			Binary: envString("SPEECH_PIPER_PATH", "piper"), Voice: voice,
+			// Tuned for calls: a little slower than piper's default, a clear
+			// pause between sentences, and 6 dB of headroom, since piper
+			// scales every sentence to full scale and its peaks clip.
+			LengthScale:     envFloat("SPEECH_PIPER_LENGTH_SCALE", 1.05),
+			NoiseScale:      envFloat("SPEECH_PIPER_NOISE_SCALE", 0),
+			NoiseW:          envFloat("SPEECH_PIPER_NOISE_W", 0),
+			SentenceSilence: envFloat("SPEECH_PIPER_SENTENCE_SILENCE", 0.3),
+			GainDB:          envFloat("SPEECH_VOICE_GAIN_DB", -6),
+		}
 		if err := p.Check(); err != nil {
 			log.Printf("sb-speech: speech output disabled: %v", err)
 		} else {
@@ -114,6 +124,13 @@ func (a *App) configure() error {
 
 func envString(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envFloat(name string, fallback float64) float64 {
+	if v, err := strconv.ParseFloat(os.Getenv(name), 64); err == nil {
 		return v
 	}
 	return fallback

@@ -28,10 +28,11 @@ type Engine interface {
 	Transcribe(ctx context.Context, samples []int16) (string, error)
 }
 
-// Voice turns text into mono samples at the requested rate: the session's,
-// 8000 or 16000.
+// Voice turns text into mono samples at the requested rate (the session's,
+// 8000 or 16000), passing them to emit as it produces them, and returns once
+// all are emitted.
 type Voice interface {
-	Synthesize(ctx context.Context, text string, rate int) ([]int16, error)
+	Synthesize(ctx context.Context, text string, rate int, emit func([]int16)) error
 }
 
 // ErrNoVoice is returned by Say when speech output is not configured.
@@ -328,7 +329,9 @@ func (s *session) say(text string) (int, error) {
 	return s.saySeq, nil
 }
 
-// speak synthesizes text and sends it as paced RTP to the session's sender.
+// speak synthesizes text and sends it as paced RTP to the session's sender. Audio
+// is sent as the voice produces it, so speech starts after the first sentence
+// rather than after the whole reply.
 func (s *session) speak(ctx context.Context, seq int, text string) {
 	defer s.done.Done()
 	publish := func(ev speech.Event) {
@@ -339,33 +342,40 @@ func (s *session) speak(ctx context.Context, seq int, text string) {
 	}
 	publish(speech.Event{Type: speech.EventSpeaking, Text: text})
 	fail := func(err string) { publish(speech.Event{Type: speech.EventSpoken, Text: text, Error: err}) }
-
-	samples, err := s.hub.cfg.Voice.Synthesize(ctx, text, s.format.rate)
-	if ctx.Err() != nil {
+	interrupted := func() {
+		s.mu.Lock()
+		s.mutedUntil = time.Now().Add(muteTail)
+		s.mu.Unlock()
 		fail("interrupted")
-		return
 	}
-	if err != nil {
-		log.Printf("sb-speech: %s: synthesize: %v", s.id, err)
-		fail(err.Error())
-		return
-	}
+
+	// Synthesis starts at once, alongside waiting for the call's audio.
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	audio := make(chan []int16, 256)
+	synthErr := make(chan error, 1)
+	s.done.Add(1)
+	go func() {
+		defer s.done.Done()
+		err := s.hub.cfg.Voice.Synthesize(ctx, text, s.format.rate, func(p []int16) {
+			select {
+			case audio <- p:
+			case <-ctx.Done():
+			}
+		})
+		close(audio)
+		synthErr <- err
+	}()
+
 	to := s.waitSender(ctx)
 	if to == nil {
 		if ctx.Err() != nil {
-			fail("interrupted")
+			interrupted()
 		} else {
 			fail("no audio from the call to reply to")
 		}
 		return
 	}
-
-	frameSamples := s.format.frameSamples()
-	frames := (len(samples) + frameSamples - 1) / frameSamples
-	start := time.Now()
-	s.mu.Lock()
-	s.mutedUntil = start.Add(time.Duration(frames)*20*time.Millisecond + muteTail)
-	s.mu.Unlock()
 
 	var hdr [4]byte
 	_, _ = rand.Read(hdr[:])
@@ -375,40 +385,88 @@ func (s *session) speak(ctx context.Context, seq int, text string) {
 	_, _ = rand.Read(ssrcb[:])
 	ts, ssrc := binary.BigEndian.Uint32(tsb[:]), binary.BigEndian.Uint32(ssrcb[:])
 
+	frameSamples := s.format.frameSamples()
 	pt, step := s.format.payloadType(), uint32(s.format.frameBytes())
 	encode := s.format.encoder()
 	packet := make([]byte, 0, rtpHeaderSize+s.format.frameBytes())
 	frame := make([]int16, frameSamples)
-	for f := 0; f < frames; f++ {
-		if wait := time.Until(start.Add(time.Duration(f) * 20 * time.Millisecond)); wait > 0 {
+	var pending []int16
+	more := true
+	var start time.Time
+	sent := 0 // frames since start
+	for {
+		for more && len(pending) < frameSamples {
+			select {
+			case p, ok := <-audio:
+				if !ok {
+					more = false
+				} else {
+					pending = append(pending, p...)
+				}
+			case <-ctx.Done():
+				interrupted()
+				return
+			}
+		}
+		if len(pending) == 0 {
+			break
+		}
+		clear(frame)
+		n := copy(frame, pending)
+		pending = pending[n:]
+
+		marker := sent == 0
+		now := time.Now()
+		if sent == 0 {
+			start = now
+		} else if due := start.Add(time.Duration(sent) * frameMillis * time.Millisecond); now.Sub(due) > frameMillis*time.Millisecond {
+			// Late: the voice fell behind, or the machine was busy. Sending the
+			// backlog at once would make the phone rush to catch up, so carry
+			// on from now, with the timestamp moved on over the gap.
+			skipped := int(now.Sub(due) / (frameMillis * time.Millisecond))
+			ts += uint32(skipped) * step
+			start = now.Add(-time.Duration(sent) * frameMillis * time.Millisecond)
+			marker = true
+		} else if wait := due.Sub(now); wait > 0 {
 			select {
 			case <-time.After(wait):
 			case <-ctx.Done():
+				interrupted()
+				return
 			}
 		}
 		if ctx.Err() != nil {
-			s.mu.Lock()
-			s.mutedUntil = time.Now().Add(muteTail)
-			s.mu.Unlock()
-			fail("interrupted")
+			interrupted()
 			return
 		}
+		s.mu.Lock()
+		s.mutedUntil = start.Add(time.Duration(sent+1)*frameMillis*time.Millisecond + muteTail)
+		s.mu.Unlock()
+
 		packet = packet[:rtpHeaderSize]
 		packet[0], packet[1] = 0x80, pt
-		if f == 0 {
+		if marker {
 			packet[1] |= 0x80 // marker: start of a talkspurt
 		}
 		binary.BigEndian.PutUint16(packet[2:], rtpSeq)
 		binary.BigEndian.PutUint32(packet[4:], ts)
 		binary.BigEndian.PutUint32(packet[8:], ssrc)
-		clear(frame)
-		copy(frame, samples[min(f*frameSamples, len(samples)):])
 		packet = encode(packet, frame)
 		if _, err := s.conn.WriteToUDP(packet, to); err != nil && s.ctx.Err() == nil {
 			log.Printf("sb-speech: %s: send: %v", s.id, err)
 		}
 		rtpSeq++
 		ts += step
+		sent++
+	}
+	if err := <-synthErr; err != nil {
+		if ctx.Err() != nil {
+			interrupted()
+			return
+		}
+		log.Printf("sb-speech: %s: synthesize: %v", s.id, err)
+		fail(err.Error())
+		return
 	}
 	publish(speech.Event{Type: speech.EventSpoken, Text: text})
 }

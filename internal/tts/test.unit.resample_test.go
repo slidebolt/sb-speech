@@ -50,3 +50,23 @@ func TestResampleSameRateCopies(t *testing.T) {
 		t.Fatal("same-rate resample should return a copy")
 	}
 }
+
+// Resampling in pieces gives exactly what resampling in one go gives.
+func TestResamplerStreamsSeamlessly(t *testing.T) {
+	in := tone(1000, 22050, 22050)
+	want := Resample(in, 22050, 16000)
+	r := NewResampler(22050, 16000)
+	var got []int16
+	for i := 0; i < len(in); i += 4096 + i%7 {
+		got = append(got, r.Write(in[i:min(len(in), i+4096+i%7)])...)
+	}
+	got = append(got, r.Flush()...)
+	if len(got) != len(want) {
+		t.Fatalf("length %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sample %d: %d, want %d", i, got[i], want[i])
+		}
+	}
+}

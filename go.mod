@@ -3,9 +3,9 @@ module github.com/slidebolt/sb-speech
 go 1.26.1
 
 require (
-	github.com/slidebolt/sb-contract v1.0.6
-	github.com/slidebolt/sb-messenger-sdk v1.0.8
-	github.com/slidebolt/sb-runtime v1.0.6
+	github.com/slidebolt/sb-contract v1.0.9
+	github.com/slidebolt/sb-messenger-sdk v1.0.9
+	github.com/slidebolt/sb-runtime v1.0.7
 	github.com/slidebolt/sb-speech-sdk v1.0.3
 )
 

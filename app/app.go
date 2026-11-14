@@ -42,9 +42,9 @@ func (a *App) Hello() contract.HelloResponse {
 			{Key: "rtpHost", Environment: "SPEECH_RTP_HOST", Name: "RTP host", Control: contract.SetupText, Default: json.RawMessage(`"127.0.0.1"`), Advanced: true},
 			{Key: "voice", Environment: "SPEECH_PIPER_VOICE", Name: "Piper voice model", Control: contract.SetupText, Advanced: true},
 		}, Tools: []contract.ToolRequirement{
-			{ID: "whisper-cli", Environment: "SPEECH_WHISPER_PATH", Required: true},
-			{ID: "whisper-model", Environment: "SPEECH_WHISPER_MODEL", Required: true},
-			{ID: "piper", Environment: "SPEECH_PIPER_PATH"},
+			{ID: "whisper-cli", Name: "Whisper CLI", Description: "Transcribes captured speech.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Environment: "SPEECH_WHISPER_PATH", Required: true, InstallHint: "Install whisper-cli or set SPEECH_WHISPER_PATH.", Checks: []contract.ToolCheck{{Arguments: []string{"--help"}}}},
+			{ID: "whisper-model", Name: "Whisper model", Description: "Model data used for speech transcription.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindFile, Environment: "SPEECH_WHISPER_MODEL", Default: "/app/models/ggml-base.en.bin", Required: true, InstallHint: "Set SPEECH_WHISPER_MODEL to a readable Whisper model file."},
+			{ID: "piper", Name: "Piper", Description: "Generates spoken replies.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Environment: "SPEECH_PIPER_PATH", InstallHint: "Install Piper or set SPEECH_PIPER_PATH.", Checks: []contract.ToolCheck{{Arguments: []string{"--help"}}}},
 		}},
 	}
 }

@@ -49,3 +49,21 @@ func TestOnStart_TransportOnlyReportsUnavailable(t *testing.T) {
 		t.Fatalf("say err = %v", err)
 	}
 }
+
+func TestCapabilitiesReportServiceConfigurationFailure(t *testing.T) {
+	t.Setenv("SPEECH_RTP_PORT_MIN", "70000")
+	msg, payload, err := messenger.MockWithPayload()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer msg.Close()
+	a := New()
+	if _, err := a.OnStart(map[string]json.RawMessage{"messenger": payload}); err != nil {
+		t.Fatal(err)
+	}
+	defer a.OnShutdown()
+	capabilities, err := speech.NewClient(msg).Capabilities()
+	if err != nil || !strings.Contains(capabilities.Transcription.Error, "disabled") || !strings.Contains(capabilities.Synthesis.Error, "disabled") {
+		t.Fatalf("capabilities = %+v, %v", capabilities, err)
+	}
+}

@@ -159,6 +159,14 @@ func (a *App) handleStart(m *messenger.Message) {
 }
 
 func (a *App) handleCapabilities(m *messenger.Message) {
+	if a.disabled != nil {
+		detail := "speech service is disabled: " + a.disabled.Error()
+		respond(m, speech.CapabilitiesReply{
+			Transcription: speech.CapabilityStatus{Error: detail},
+			Synthesis:     speech.CapabilityStatus{Error: detail},
+		})
+		return
+	}
 	reply := speech.CapabilitiesReply{
 		Transcription: a.capability(a.transcriber, "speech transcription provider is not configured"),
 		Synthesis:     a.capability(a.synthesizer, "speech synthesis provider is not configured"),

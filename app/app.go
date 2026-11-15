@@ -13,6 +13,7 @@ import (
 
 	contract "github.com/slidebolt/sb-contract"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
+	runtime "github.com/slidebolt/sb-runtime"
 	providercontract "github.com/slidebolt/sb-speech-provider-sdk"
 	speech "github.com/slidebolt/sb-speech-sdk"
 	"github.com/slidebolt/sb-speech/internal/hub"
@@ -30,7 +31,16 @@ type App struct {
 	disabled    error
 	transcriber *provider.Client
 	synthesizer *provider.Client
+	reporter    runtime.ResourceReporter
+	monitorStop context.CancelFunc
 }
+
+const (
+	transcriptionResource = "transcription-provider"
+	synthesisResource     = "synthesis-provider"
+)
+
+var providerHealthInterval = 15 * time.Second
 
 func New() *App {
 	return &App{}
@@ -48,9 +58,14 @@ func (a *App) Hello() contract.HelloResponse {
 			{Key: "transcriberToken", Environment: "SPEECH_TRANSCRIBER_TOKEN", Name: "Transcription provider token", Control: contract.SetupSecret, Sensitive: true, Advanced: true},
 			{Key: "synthesizerURL", Environment: "SPEECH_SYNTHESIZER_URL", Name: "Synthesis provider URL", Description: "Optional generic speech-provider endpoint.", Control: contract.SetupText, Format: "url", Advanced: true},
 			{Key: "synthesizerToken", Environment: "SPEECH_SYNTHESIZER_TOKEN", Name: "Synthesis provider token", Control: contract.SetupSecret, Sensitive: true, Advanced: true},
+		}, Resources: []contract.ExternalResourceDefinition{
+			{ID: transcriptionResource, Kind: contract.ExternalResourceService, Name: "Transcription provider", Description: "Converts recorded speech audio into text.", Fields: []string{"transcriberURL", "transcriberToken"}, Activation: contract.ResourceActivation{Mode: contract.ResourceActivationConfigured, Fields: []string{"transcriberURL"}}},
+			{ID: synthesisResource, Kind: contract.ExternalResourceService, Name: "Synthesis provider", Description: "Converts text into speech audio.", Fields: []string{"synthesizerURL", "synthesizerToken"}, Activation: contract.ResourceActivation{Mode: contract.ResourceActivationConfigured, Fields: []string{"synthesizerURL"}}},
 		}},
 	}
 }
+
+func (a *App) SetResourceReporter(reporter runtime.ResourceReporter) { a.reporter = reporter }
 
 // OnStart stays up when it cannot serve. A failed start aborts sb-manager's
 // startAll, which would stop every other binary.
@@ -64,6 +79,10 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 		a.disabled = err
 		log.Printf("sb-speech: disabled: %v", err)
 	}
+	if err := a.checkProviders(); err != nil {
+		return nil, err
+	}
+	a.startProviderMonitor()
 	handlers := map[string]func(*messenger.Message){
 		speech.SubjectCapabilities: a.handleCapabilities,
 		speech.SubjectStart:        a.handleStart,
@@ -85,6 +104,66 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 	}
 	log.Println("sb-speech: started")
 	return nil, nil
+}
+
+func (a *App) checkProviders() error {
+	var failures []string
+	for _, item := range []struct {
+		id     string
+		client *provider.Client
+	}{
+		{transcriptionResource, a.transcriber},
+		{synthesisResource, a.synthesizer},
+	} {
+		if item.client == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := item.client.Ready(ctx)
+		cancel()
+		if err != nil {
+			a.resourceDegraded(item.id, err)
+			failures = append(failures, item.id+": "+err.Error())
+			continue
+		}
+		a.resourceReady(item.id)
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("sb-speech: external resources unavailable: %s", strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+func (a *App) startProviderMonitor() {
+	if a.transcriber == nil && a.synthesizer == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.monitorStop = cancel
+	go func() {
+		ticker := time.NewTicker(providerHealthInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = a.checkProviders()
+			}
+		}
+	}()
+}
+
+func (a *App) resourceReady(id string) {
+	if a.reporter != nil {
+		a.reporter.Ready(id)
+	}
+}
+
+func (a *App) resourceDegraded(id string, err error) {
+	if a.reporter != nil {
+		a.reporter.Degraded(id, "provider_unavailable", err.Error(), true)
+	}
 }
 
 func (a *App) configure() error {
@@ -240,6 +319,9 @@ func respond(m *messenger.Message, reply any) {
 }
 
 func (a *App) OnShutdown() error {
+	if a.monitorStop != nil {
+		a.monitorStop()
+	}
 	for _, sub := range a.subs {
 		sub.Unsubscribe()
 	}

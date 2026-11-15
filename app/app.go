@@ -38,7 +38,7 @@ func (a *App) Hello() contract.HelloResponse {
 		Kind:            contract.KindService,
 		ContractVersion: contract.ContractVersion,
 		DependsOn:       []string{"messenger"},
-		Setup: &contract.SetupDefinition{Mode: contract.SetupRequired, Category: "Core", Fields: []contract.SetupField{
+		Setup: &contract.SetupDefinition{Mode: contract.SetupDependency, Category: "Voice", Fields: []contract.SetupField{
 			{Key: "rtpHost", Environment: "SPEECH_RTP_HOST", Name: "RTP host", Control: contract.SetupText, Default: json.RawMessage(`"127.0.0.1"`), Advanced: true},
 			{Key: "voice", Environment: "SPEECH_PIPER_VOICE", Name: "Piper voice model", Control: contract.SetupText, Advanced: true},
 		}, Tools: []contract.ToolRequirement{

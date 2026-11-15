@@ -14,6 +14,9 @@ func TestHello(t *testing.T) {
 	if h.ID != ServiceID || len(h.DependsOn) != 1 {
 		t.Fatalf("hello = %+v", h)
 	}
+	if h.Setup == nil || h.Setup.Mode != "dependency" {
+		t.Fatalf("setup = %+v", h.Setup)
+	}
 	if err := h.Validate(); err != nil {
 		t.Fatal(err)
 	}

@@ -22,10 +22,8 @@ func TestHello(t *testing.T) {
 	}
 }
 
-// A failed OnStart would abort startAll in sb-manager and stop everything.
-func TestOnStart_MissingWhisperStaysUpAndReportsDisabled(t *testing.T) {
+func TestOnStart_TransportOnlyReportsUnavailable(t *testing.T) {
 	t.Setenv("SPEECH_RTP_HOST", "127.0.0.1")
-	t.Setenv("SPEECH_WHISPER_PATH", "no-such-binary")
 	msg, payload, err := messenger.MockWithPayload()
 	if err != nil {
 		t.Fatal(err)
@@ -37,13 +35,17 @@ func TestOnStart_MissingWhisperStaysUpAndReportsDisabled(t *testing.T) {
 	}
 	defer a.OnShutdown()
 	client := speech.NewClient(msg)
-	if _, err := client.Start(speech.StartRequest{}); err == nil || !strings.Contains(err.Error(), "disabled") {
+	capabilities, err := client.Capabilities()
+	if err != nil || capabilities.Transcription.Available || capabilities.Synthesis.Available {
+		t.Fatalf("capabilities = %+v, %v", capabilities, err)
+	}
+	if _, err := client.Start(speech.StartRequest{}); err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("start err = %v", err)
 	}
-	if err := client.Stop("x"); err == nil || !strings.Contains(err.Error(), "disabled") {
+	if err := client.Stop("x"); err != nil {
 		t.Fatalf("stop err = %v", err)
 	}
-	if _, err := client.Say("x", "hi"); err == nil || !strings.Contains(err.Error(), "disabled") {
+	if _, err := client.Say("x", "hi"); err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Fatalf("say err = %v", err)
 	}
 }

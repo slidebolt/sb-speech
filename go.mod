@@ -6,7 +6,8 @@ require (
 	github.com/slidebolt/sb-contract v1.0.11
 	github.com/slidebolt/sb-messenger-sdk v1.0.9
 	github.com/slidebolt/sb-runtime v1.0.7
-	github.com/slidebolt/sb-speech-sdk v1.0.3
+	github.com/slidebolt/sb-speech-provider-sdk v1.0.0
+	github.com/slidebolt/sb-speech-sdk v1.0.4
 )
 
 require (

@@ -1,59 +1,13 @@
-// Package whisper runs whisper.cpp to turn speech into text.
+// Package whisper contains the engine-neutral audio encoding and transcript
+// cleanup used when talking to an isolated transcription provider.
 package whisper
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
-	"fmt"
-	"os"
-	"os/exec"
 	"regexp"
-	"strconv"
 	"strings"
 )
-
-// Engine runs whisper-cli once per utterance.
-type Engine struct {
-	Binary  string
-	Model   string
-	Threads int
-}
-
-// Check confirms the binary and model exist.
-func (e Engine) Check() error {
-	if _, err := exec.LookPath(e.Binary); err != nil {
-		return fmt.Errorf("whisper binary: %w", err)
-	}
-	if _, err := os.Stat(e.Model); err != nil {
-		return fmt.Errorf("whisper model: %w", err)
-	}
-	return nil
-}
-
-// Transcribe returns the text of 16 kHz mono samples.
-func (e Engine) Transcribe(ctx context.Context, samples []int16) (string, error) {
-	f, err := os.CreateTemp("", "utterance-*.wav")
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(f.Name())
-	if _, err := f.Write(EncodeWAV(samples)); err != nil {
-		f.Close()
-		return "", err
-	}
-	f.Close()
-
-	var stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, e.Binary, "-m", e.Model, "-f", f.Name(), "-l", "en",
-		"-t", strconv.Itoa(e.Threads), "--no-timestamps", "--no-prints")
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("whisper: %w: %s", err, strings.TrimSpace(stderr.String()))
-	}
-	return CleanText(string(out)), nil
-}
 
 // nonSpeech matches the markers whisper emits for sounds, such as [BLANK_AUDIO] or (wind).
 var nonSpeech = regexp.MustCompile(`\[[^\]]*\]|\([^)]*\)|\*[^*]*\*`)

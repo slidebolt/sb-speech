@@ -1,20 +1,22 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
-	"runtime"
 	"strconv"
+	"strings"
+	"time"
 
 	contract "github.com/slidebolt/sb-contract"
 	messenger "github.com/slidebolt/sb-messenger-sdk"
+	providercontract "github.com/slidebolt/sb-speech-provider-sdk"
 	speech "github.com/slidebolt/sb-speech-sdk"
 	"github.com/slidebolt/sb-speech/internal/hub"
-	"github.com/slidebolt/sb-speech/internal/tts"
-	"github.com/slidebolt/sb-speech/internal/whisper"
+	"github.com/slidebolt/sb-speech/internal/provider"
 )
 
 // ServiceID is the identifier other binaries use in DependsOn.
@@ -22,10 +24,12 @@ const ServiceID = "speech"
 
 // App is the sb-speech service.
 type App struct {
-	msg      messenger.Messenger
-	subs     []messenger.Subscription
-	hub      *hub.Hub
-	disabled error
+	msg         messenger.Messenger
+	subs        []messenger.Subscription
+	hub         *hub.Hub
+	disabled    error
+	transcriber *provider.Client
+	synthesizer *provider.Client
 }
 
 func New() *App {
@@ -40,11 +44,10 @@ func (a *App) Hello() contract.HelloResponse {
 		DependsOn:       []string{"messenger"},
 		Setup: &contract.SetupDefinition{Mode: contract.SetupDependency, Category: "Voice", Fields: []contract.SetupField{
 			{Key: "rtpHost", Environment: "SPEECH_RTP_HOST", Name: "RTP host", Control: contract.SetupText, Default: json.RawMessage(`"127.0.0.1"`), Advanced: true},
-			{Key: "voice", Environment: "SPEECH_PIPER_VOICE", Name: "Piper voice model", Control: contract.SetupText, Advanced: true},
-		}, Tools: []contract.ToolRequirement{
-			{ID: "whisper-cli", Name: "Whisper CLI", Description: "Transcribes captured speech.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Environment: "SPEECH_WHISPER_PATH", Required: true, InstallHint: "Install whisper-cli or set SPEECH_WHISPER_PATH.", Checks: []contract.ToolCheck{{Arguments: []string{"--help"}}}},
-			{ID: "whisper-model", Name: "Whisper model", Description: "Model data used for speech transcription.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindFile, Environment: "SPEECH_WHISPER_MODEL", Default: "/app/models/ggml-base.en.bin", Required: true, InstallHint: "Set SPEECH_WHISPER_MODEL to a readable Whisper model file."},
-			{ID: "piper", Name: "Piper", Description: "Generates spoken replies.", Source: contract.ToolSourceSystem, Kind: contract.ToolKindExecutable, Environment: "SPEECH_PIPER_PATH", InstallHint: "Install Piper or set SPEECH_PIPER_PATH.", Checks: []contract.ToolCheck{{Arguments: []string{"--help"}}}},
+			{Key: "transcriberURL", Environment: "SPEECH_TRANSCRIBER_URL", Name: "Transcription provider URL", Description: "Optional generic speech-provider endpoint.", Control: contract.SetupText, Format: "url", Advanced: true},
+			{Key: "transcriberToken", Environment: "SPEECH_TRANSCRIBER_TOKEN", Name: "Transcription provider token", Control: contract.SetupSecret, Sensitive: true, Advanced: true},
+			{Key: "synthesizerURL", Environment: "SPEECH_SYNTHESIZER_URL", Name: "Synthesis provider URL", Description: "Optional generic speech-provider endpoint.", Control: contract.SetupText, Format: "url", Advanced: true},
+			{Key: "synthesizerToken", Environment: "SPEECH_SYNTHESIZER_TOKEN", Name: "Synthesis provider token", Control: contract.SetupSecret, Sensitive: true, Advanced: true},
 		}},
 	}
 }
@@ -62,9 +65,10 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 		log.Printf("sb-speech: disabled: %v", err)
 	}
 	handlers := map[string]func(*messenger.Message){
-		speech.SubjectStart: a.handleStart,
-		speech.SubjectStop:  a.handleStop,
-		speech.SubjectSay:   a.handleSay,
+		speech.SubjectCapabilities: a.handleCapabilities,
+		speech.SubjectStart:        a.handleStart,
+		speech.SubjectStop:         a.handleStop,
+		speech.SubjectSay:          a.handleSay,
 	}
 	for subject, handler := range handlers {
 		sub, err := msg.Subscribe(subject, handler)
@@ -84,61 +88,33 @@ func (a *App) OnStart(deps map[string]json.RawMessage) (json.RawMessage, error) 
 }
 
 func (a *App) configure() error {
-	host := os.Getenv("SPEECH_RTP_HOST")
-	if host == "" {
-		return errors.New("SPEECH_RTP_HOST is required")
-	}
-	engine := whisper.Engine{
-		Binary:  envString("SPEECH_WHISPER_PATH", "whisper-cli"),
-		Model:   envString("SPEECH_WHISPER_MODEL", "/app/models/ggml-base.en.bin"),
-		Threads: envInt("SPEECH_THREADS", max(1, runtime.NumCPU()/2)),
-	}
-	if err := engine.Check(); err != nil {
-		return err
-	}
+	host := envString("SPEECH_RTP_HOST", "127.0.0.1")
 	portMin, portMax := envInt("SPEECH_RTP_PORT_MIN", 41100), envInt("SPEECH_RTP_PORT_MAX", 41199)
 	if portMin <= 0 || portMax < portMin || portMax > 65535 {
 		return errors.New("SPEECH_RTP_PORT_MIN and SPEECH_RTP_PORT_MAX are not a valid range")
 	}
-	cfg := hub.Config{
+	var engine hub.Engine
+	if url := strings.TrimSpace(os.Getenv("SPEECH_TRANSCRIBER_URL")); url != "" {
+		a.transcriber = provider.New(url, os.Getenv("SPEECH_TRANSCRIBER_TOKEN"), providercontract.CapabilityTranscription)
+		engine = a.transcriber
+	}
+	var voice hub.Voice
+	if url := strings.TrimSpace(os.Getenv("SPEECH_SYNTHESIZER_URL")); url != "" {
+		a.synthesizer = provider.New(url, os.Getenv("SPEECH_SYNTHESIZER_TOKEN"), providercontract.CapabilitySynthesis)
+		voice = a.synthesizer
+	}
+	a.hub = hub.New(hub.Config{
 		RTPHost: host, PortMin: portMin, PortMax: portMax,
 		SilenceMillis: envInt("SPEECH_SILENCE_MILLIS", 700),
 		Engine:        engine,
+		Voice:         voice,
 		Publish:       a.publish,
-	}
-	// Speech output is optional: without a voice, transcription still works.
-	if voice := os.Getenv("SPEECH_PIPER_VOICE"); voice != "" {
-		p := &tts.Piper{
-			Binary: envString("SPEECH_PIPER_PATH", "piper"), Voice: voice,
-			// Tuned for calls: a little slower than piper's default, a clear
-			// pause between sentences, and 6 dB of headroom, since piper
-			// scales every sentence to full scale and its peaks clip.
-			LengthScale:     envFloat("SPEECH_PIPER_LENGTH_SCALE", 1.05),
-			NoiseScale:      envFloat("SPEECH_PIPER_NOISE_SCALE", 0),
-			NoiseW:          envFloat("SPEECH_PIPER_NOISE_W", 0),
-			SentenceSilence: envFloat("SPEECH_PIPER_SENTENCE_SILENCE", 0.3),
-			GainDB:          envFloat("SPEECH_VOICE_GAIN_DB", -6),
-		}
-		if err := p.Check(); err != nil {
-			log.Printf("sb-speech: speech output disabled: %v", err)
-		} else {
-			cfg.Voice = p
-			log.Println("sb-speech: speech output enabled")
-		}
-	}
-	a.hub = hub.New(cfg)
+	})
 	return nil
 }
 
 func envString(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envFloat(name string, fallback float64) float64 {
-	if v, err := strconv.ParseFloat(os.Getenv(name), 64); err == nil {
 		return v
 	}
 	return fallback
@@ -167,6 +143,9 @@ func (a *App) handleStart(m *messenger.Message) {
 	switch {
 	case a.disabled != nil:
 		reply.Error = "speech service is disabled: " + a.disabled.Error()
+	case a.transcriber == nil:
+		reply.Error = "speech transcription provider is not configured"
+	case !a.ready(a.transcriber, &reply.Error):
 	case json.Unmarshal(m.Data, &req) != nil:
 		reply.Error = "invalid request"
 	default:
@@ -177,6 +156,34 @@ func (a *App) handleStart(m *messenger.Message) {
 		}
 	}
 	respond(m, reply)
+}
+
+func (a *App) handleCapabilities(m *messenger.Message) {
+	reply := speech.CapabilitiesReply{
+		Transcription: a.capability(a.transcriber, "speech transcription provider is not configured"),
+		Synthesis:     a.capability(a.synthesizer, "speech synthesis provider is not configured"),
+	}
+	respond(m, reply)
+}
+
+func (a *App) capability(client *provider.Client, missing string) speech.CapabilityStatus {
+	if client == nil {
+		return speech.CapabilityStatus{Error: missing}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := client.Ready(ctx); err != nil {
+		return speech.CapabilityStatus{Error: err.Error()}
+	}
+	return speech.CapabilityStatus{Available: true}
+}
+
+func (a *App) ready(client *provider.Client, detail *string) bool {
+	status := a.capability(client, "speech provider is not configured")
+	if !status.Available {
+		*detail = status.Error
+	}
+	return status.Available
 }
 
 func (a *App) handleStop(m *messenger.Message) {
@@ -199,6 +206,9 @@ func (a *App) handleSay(m *messenger.Message) {
 	switch {
 	case a.disabled != nil:
 		reply.Error = "speech service is disabled: " + a.disabled.Error()
+	case a.synthesizer == nil:
+		reply.Error = "speech synthesis provider is not configured"
+	case !a.ready(a.synthesizer, &reply.Error):
 	case json.Unmarshal(m.Data, &req) != nil:
 		reply.Error = "invalid request"
 	default:
